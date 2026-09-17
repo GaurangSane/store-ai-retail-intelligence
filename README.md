@@ -45,15 +45,20 @@ Running code can be shared: `requirements.txt`, the CSV files, and the Python sc
 streamlit run dashboard.py
 ```
 
-The dashboard has sections for Overview, Product Performance, Inventory & Sizes, Trading Days, Customer Patterns, AI Manager Actions, and Final Report.
+The dashboard has sections for Overview, Product Performance, Inventory & Sizes, Reorder Priority, Slow Stock / Markdown Priority, Trading Days, Customer Patterns, AI Manager Actions, and Final Report.
 
-## Monthly Workflow
+## Manager Workflow
 
-1. Replace the three CSV files with the latest month of store data.
-2. Run `python insight_engine.py`.
-3. Review `outputs/store_report.md` or `outputs/store_report.pdf`.
-4. Open `streamlit run dashboard.py` for interactive review.
-5. Use the three next-week actions in the store planning meeting.
+1. Open the dashboard with `streamlit run dashboard.py`.
+2. See the included/default analysis automatically; no upload is required.
+3. Upload only the new monthly `sales_data.csv` from POS, Tally, or Excel and choose **Run Analysis**.
+4. The included product master and inventory files are reused by default.
+5. Use **Advanced optional files** only when the product or inventory reference files changed.
+6. Review the exactly three next-week actions and download the regenerated PDF report.
+
+For assignment submission, the default CSV files are included. In real use, the manager usually uploads only the latest monthly sales file.
+
+The command-line workflow remains unchanged: `python insight_engine.py` analyzes the included default files and regenerates all outputs.
 
 ## Outputs Generated
 

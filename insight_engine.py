@@ -46,10 +46,14 @@ DEFAULT_LLM_MODEL = "openai/gpt-oss-20b"
 DEFAULT_LLM_PROVIDER = "Groq OpenAI-compatible API"
 LLM_TEMPERATURE = 0.2
 CUSTOMER_PATTERN_MIN_SUPPORT = 40
+INVENTORY_DATE_RANGE_WARNING = (
+    "Uploaded sales period does not overlap the active inventory file period. "
+    "Inventory and reorder metrics may be stale unless you upload the matching inventory file."
+)
 
 REPORT_FALLBACK_EXPLANATION = (
-    "This explanation was generated from deterministic Python-calculated facts. "
-    "The LLM layer is optional; all business numbers in this report come from the CSV files."
+    "Python generated this short manager interpretation from the verified store figures. "
+    "The optional AI service was not used, and all business numbers still come from the CSV files."
 )
 
 AI_INSIGHTS_FALLBACK_EXPLANATION = (
@@ -67,6 +71,17 @@ REQUIRED_SALES_COLUMNS = {
     "age_group",
     "sku_id",
 }
+REQUIRED_PRODUCT_COLUMNS = {"sku_id", "product_name", "size"}
+REQUIRED_INVENTORY_COLUMNS = {
+    "date",
+    "sku_id",
+    "opening_stock",
+    "stock_received",
+    "returns",
+    "adjustments",
+    "quantity_sold",
+    "closing_stock",
+}
 
 
 @dataclass
@@ -82,6 +97,9 @@ class Analysis:
     inventory_movement: pd.DataFrame
     weekday_perf: pd.DataFrame
     customer_patterns: pd.DataFrame
+    reorder_priority: pd.DataFrame
+    slow_stock_priority: pd.DataFrame
+    customer_summary: list[str]
     actions: list[str]
     answers: dict
 
@@ -90,46 +108,89 @@ def money(value: float) -> str:
     return f"Rs. {value:,.0f}"
 
 
-def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
-    sales = pd.read_csv(SALES_FILE)
+def prepare_sales_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    sales = frame.copy()
     missing = REQUIRED_SALES_COLUMNS - set(sales.columns)
     if missing:
         raise ValueError(f"sales_data.csv is missing required columns: {', '.join(sorted(missing))}")
+    if sales.empty:
+        raise ValueError("sales_data.csv has no sales rows")
 
     sales["date"] = pd.to_datetime(sales["date"], errors="raise")
     sales["quantity_sold"] = pd.to_numeric(sales["quantity_sold"], errors="raise")
     sales["total_amount (Rs.)"] = pd.to_numeric(sales["total_amount (Rs.)"], errors="raise")
+    sales["sku_id"] = sales["sku_id"].astype(str).str.strip()
+    sales["day_of_week"] = sales["date"].dt.day_name()
+    return sales
 
-    products = pd.read_csv(PRODUCT_FILE) if PRODUCT_FILE.exists() else None
-    inventory = pd.read_csv(INVENTORY_FILE) if INVENTORY_FILE.exists() else None
-    if inventory is not None:
-        inventory["date"] = pd.to_datetime(inventory["date"], errors="raise")
-        required_inventory_columns = {
-            "date",
-            "sku_id",
-            "opening_stock",
-            "stock_received",
-            "returns",
-            "adjustments",
-            "quantity_sold",
-            "closing_stock",
-        }
-        missing_inventory = required_inventory_columns - set(inventory.columns)
-        if missing_inventory:
-            raise ValueError(
-                "inventory_daily.csv is missing required columns: "
-                + ", ".join(sorted(missing_inventory))
-            )
-        for column in [
-            "opening_stock",
-            "stock_received",
-            "returns",
-            "adjustments",
-            "quantity_sold",
-            "closing_stock",
-        ]:
-            inventory[column] = pd.to_numeric(inventory[column], errors="coerce").fillna(0)
+
+def prepare_products_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    if frame is None:
+        return None
+    products = frame.copy()
+    missing = REQUIRED_PRODUCT_COLUMNS - set(products.columns)
+    if missing:
+        raise ValueError(
+            "product_master.csv is missing required columns: " + ", ".join(sorted(missing))
+        )
+    products["sku_id"] = products["sku_id"].astype(str).str.strip()
+    if products["sku_id"].duplicated().any():
+        raise ValueError("product_master.csv must contain one row per sku_id")
+    if "cost_price" in products.columns:
+        products["cost_price"] = pd.to_numeric(products["cost_price"], errors="coerce")
+    return products
+
+
+def prepare_inventory_frame(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    if frame is None:
+        return None
+    inventory = frame.copy()
+    missing = REQUIRED_INVENTORY_COLUMNS - set(inventory.columns)
+    if missing:
+        raise ValueError(
+            "inventory_daily.csv is missing required columns: " + ", ".join(sorted(missing))
+        )
+    inventory["date"] = pd.to_datetime(inventory["date"], errors="raise")
+    inventory["sku_id"] = inventory["sku_id"].astype(str).str.strip()
+    for column in [
+        "opening_stock",
+        "stock_received",
+        "returns",
+        "adjustments",
+        "quantity_sold",
+        "closing_stock",
+    ]:
+        inventory[column] = pd.to_numeric(inventory[column], errors="coerce").fillna(0)
+    return inventory
+
+
+def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+    sales = prepare_sales_frame(pd.read_csv(SALES_FILE))
+    products = prepare_products_frame(pd.read_csv(PRODUCT_FILE) if PRODUCT_FILE.exists() else None)
+    inventory = prepare_inventory_frame(
+        pd.read_csv(INVENTORY_FILE) if INVENTORY_FILE.exists() else None
+    )
     return sales, products, inventory
+
+
+def missing_product_skus(sales: pd.DataFrame, products: pd.DataFrame | None) -> list[str]:
+    if products is None or "sku_id" not in products.columns:
+        return sorted(sales["sku_id"].dropna().astype(str).unique().tolist())
+    known = set(products["sku_id"].dropna().astype(str))
+    return sorted(set(sales["sku_id"].dropna().astype(str)) - known)
+
+
+def inventory_date_range_warning(
+    sales: pd.DataFrame,
+    inventory: pd.DataFrame | None,
+) -> str | None:
+    """Return a non-blocking warning when sales and inventory periods do not overlap."""
+    if inventory is None or inventory.empty:
+        return None
+    sales_start, sales_end = sales["date"].min(), sales["date"].max()
+    inventory_start, inventory_end = inventory["date"].min(), inventory["date"].max()
+    periods_overlap = sales_start <= inventory_end and inventory_start <= sales_end
+    return None if periods_overlap else INVENTORY_DATE_RANGE_WARNING
 
 
 def calculate_product_performance(sales: pd.DataFrame, products: pd.DataFrame | None) -> pd.DataFrame:
@@ -156,6 +217,22 @@ def calculate_product_performance(sales: pd.DataFrame, products: pd.DataFrame | 
         grouped["gross_margin_rs"] = float("nan")
     grouped["gross_margin_pct"] = grouped["gross_margin_rs"].div(grouped["revenue"]).mul(100)
     grouped["revenue_share_pct"] = grouped["revenue"] / grouped["revenue"].sum() * 100
+    high_volume_cutoff = grouped["units"].quantile(0.75)
+    low_volume_cutoff = grouped["units"].quantile(0.25)
+
+    def decision(row) -> str:
+        margin = row["gross_margin_pct"]
+        healthy_margin = pd.notna(margin) and margin >= 35
+        weak_margin = pd.isna(margin) or margin < 35
+        if row["units"] >= high_volume_cutoff and healthy_margin:
+            return "High volume + healthy margin: protect availability."
+        if row["units"] <= low_volume_cutoff and weak_margin:
+            return "Low volume + weak margin: review buying and markdown need."
+        if row["units"] <= low_volume_cutoff and healthy_margin:
+            return "Low volume + high margin: test display or bundling before discount."
+        return "Monitor availability, margin, and sell-through together."
+
+    grouped["manager_interpretation"] = grouped.apply(decision, axis=1)
     return grouped.sort_values(["units", "revenue"], ascending=[False, False]).reset_index(drop=True)
 
 
@@ -258,7 +335,17 @@ def calculate_weekday_performance(sales: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_customer_patterns(sales: pd.DataFrame) -> pd.DataFrame:
     if "category" not in sales.columns:
-        raise ValueError("sales_data.csv must include category for customer category lift analysis")
+        return pd.DataFrame(
+            columns=[
+                "segment",
+                "category",
+                "segment_share_pct",
+                "store_share_pct",
+                "lift",
+                "support_units",
+                "business_meaning",
+            ]
+        )
 
     segment_categories = sales.groupby(
         ["customer_gender", "age_group", "category"], as_index=False
@@ -303,6 +390,19 @@ def calculate_customer_patterns(sales: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def customer_pattern_summaries(patterns: pd.DataFrame, limit: int = 2) -> list[str]:
+    summaries = []
+    for row in patterns.head(limit).itertuples(index=False):
+        gender, age = row.segment.split(" - ", maxsplit=1)
+        age_label = age.split(" (")[0]
+        if gender == "Female" and age_label == "Young Adult":
+            segment_label = "Young Adult Female"
+        else:
+            segment_label = f"{gender} {age_label}"
+        summaries.append(f"{segment_label} segment over-indexes toward {row.category}.")
+    return summaries
+
+
 def customer_pattern_sentence(row) -> str:
     return (
         f"{row.segment}: {row.category} was {row.segment_share_pct:.1f}% of segment units versus "
@@ -323,20 +423,235 @@ def stock_notes_for_product(product: str, sales: pd.DataFrame, inventory: pd.Dat
     return "no SKU-level stockout evidence, so slow movement looks demand-led"
 
 
-def build_actions(product_perf: pd.DataFrame, size_inventory: pd.DataFrame, weekday_perf: pd.DataFrame) -> list[str]:
-    top_product = product_perf.iloc[0]["product_name"]
-    slow_product = product_perf.sort_values(["units", "revenue"], ascending=[True, True]).iloc[0]["product_name"]
-    pressure = size_inventory.sort_values(["stockout_sku_days", "units"], ascending=[False, False]).iloc[0]
-    slow_day = weekday_perf.sort_values("avg_revenue_per_day").iloc[0]["day_of_week"]
+def _recent_velocity(sales: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+    last_date = sales["date"].max()
+    first_date = max(sales["date"].min(), last_date - pd.Timedelta(days=6))
+    recent_days = max((last_date - first_date).days + 1, 1)
+    recent = sales.loc[sales["date"].between(first_date, last_date)]
+    result = recent.groupby(group_columns, as_index=False).agg(
+        recent_units=("quantity_sold", "sum")
+    )
+    result["recent_daily_velocity"] = result["recent_units"] / recent_days
+    return result.drop(columns="recent_units")
+
+
+def calculate_reorder_priority(
+    sales: pd.DataFrame,
+    products: pd.DataFrame | None,
+    inventory: pd.DataFrame | None,
+) -> pd.DataFrame:
+    keys = ["product_name", "size"]
+    alpha_sales = sales.loc[sales["size"].astype(str).isin(ALPHA_SIZES)].copy()
+    sold = alpha_sales.groupby(keys, as_index=False).agg(units_sold=("quantity_sold", "sum"))
+    velocity = _recent_velocity(alpha_sales, keys)
+    result = sold.merge(velocity, on=keys, how="outer")
+
+    if inventory is not None and products is not None:
+        sku_map = products[["sku_id", "product_name", "size"]].drop_duplicates("sku_id")
+        inv = inventory.merge(sku_map, on="sku_id", how="inner", validate="many_to_one")
+        inv = inv.loc[inv["size"].astype(str).isin(ALPHA_SIZES)]
+        stockouts = (
+            inv.loc[inv["closing_stock"] <= 0]
+            .groupby(keys)
+            .size()
+            .rename("stockout_sku_days")
+            .reset_index()
+        )
+        ending = (
+            inv.loc[inv["date"] == inv["date"].max()]
+            .groupby(keys, as_index=False)
+            .agg(ending_stock=("closing_stock", "sum"))
+        )
+        inventory_summary = ending.merge(stockouts, on=keys, how="outer")
+        result = result.merge(inventory_summary, on=keys, how="outer")
+
+    if "ending_stock" in result.columns:
+        result["has_inventory_match"] = result["ending_stock"].notna()
+    else:
+        result["has_inventory_match"] = False
+    for column in ["units_sold", "stockout_sku_days", "ending_stock", "recent_daily_velocity"]:
+        if column not in result.columns:
+            result[column] = 0.0
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    result["days_of_cover"] = result["ending_stock"].div(
+        result["recent_daily_velocity"].replace(0, float("nan"))
+    )
+    result.loc[~result["has_inventory_match"], "days_of_cover"] = float("nan")
+    positive_velocity = result.loc[result["recent_daily_velocity"] > 0, "recent_daily_velocity"]
+    high_velocity = positive_velocity.quantile(0.75) if not positive_velocity.empty else float("inf")
+    high = (
+        result["has_inventory_match"]
+        & result["stockout_sku_days"].gt(0)
+        & result["days_of_cover"].lt(14)
+    )
+    medium = (
+        result["has_inventory_match"]
+        & (
+            result["days_of_cover"].lt(21)
+            | result["recent_daily_velocity"].ge(high_velocity)
+        )
+    ) & ~high
+    result["reorder_priority"] = "Low"
+    result.loc[medium, "reorder_priority"] = "Medium"
+    result.loc[high, "reorder_priority"] = "High"
+    priority_order = pd.CategoricalDtype(["High", "Medium", "Low"], ordered=True)
+    result["reorder_priority"] = result["reorder_priority"].astype(priority_order)
+    result = result.sort_values(
+        ["reorder_priority", "stockout_sku_days", "recent_daily_velocity"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+    result["reorder_priority"] = result["reorder_priority"].astype(str)
+    return result[
+        [
+            "product_name",
+            "size",
+            "units_sold",
+            "stockout_sku_days",
+            "ending_stock",
+            "recent_daily_velocity",
+            "days_of_cover",
+            "reorder_priority",
+        ]
+    ]
+
+
+def calculate_slow_stock_priority(
+    product_perf: pd.DataFrame,
+    sales: pd.DataFrame,
+    products: pd.DataFrame | None,
+    inventory: pd.DataFrame | None,
+) -> pd.DataFrame:
+    result = product_perf[
+        ["product_name", "units", "revenue", "gross_margin_pct"]
+    ].rename(columns={"units": "units_sold"})
+    velocity = _recent_velocity(sales, ["product_name"])
+    result = result.merge(velocity, on="product_name", how="left")
+    if inventory is not None and products is not None:
+        inv = inventory.merge(
+            products[["sku_id", "product_name"]].drop_duplicates("sku_id"),
+            on="sku_id",
+            how="inner",
+            validate="many_to_one",
+        )
+        ending = (
+            inv.loc[inv["date"] == inv["date"].max()]
+            .groupby("product_name", as_index=False)
+            .agg(ending_stock=("closing_stock", "sum"))
+        )
+        result = result.merge(ending, on="product_name", how="left")
+    result["recent_daily_velocity"] = result["recent_daily_velocity"].fillna(0)
+    if "ending_stock" not in result.columns:
+        result["ending_stock"] = 0.0
+    result["ending_stock"] = result["ending_stock"].fillna(0)
+    result["days_of_cover"] = result["ending_stock"].div(
+        result["recent_daily_velocity"].replace(0, float("nan"))
+    )
+    low_units = result["units_sold"].quantile(0.35)
+    median_units = result["units_sold"].median()
+    high = (
+        result["units_sold"].le(low_units)
+        & result["ending_stock"].ge(8)
+        & (result["days_of_cover"].ge(45) | result["recent_daily_velocity"].eq(0))
+    )
+    medium = (
+        result["ending_stock"].ge(5)
+        & (result["units_sold"].le(median_units) | result["days_of_cover"].ge(30))
+        & ~high
+    )
+    result["markdown_priority"] = "Low"
+    result.loc[medium, "markdown_priority"] = "Medium"
+    result.loc[high, "markdown_priority"] = "High"
+    priority_order = pd.CategoricalDtype(["High", "Medium", "Low"], ordered=True)
+    result["markdown_priority"] = result["markdown_priority"].astype(priority_order)
+    result = result.sort_values(
+        ["markdown_priority", "units_sold", "days_of_cover"],
+        ascending=[True, True, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    result["markdown_priority"] = result["markdown_priority"].astype(str)
+    return result[
+        [
+            "product_name",
+            "units_sold",
+            "revenue",
+            "gross_margin_pct",
+            "ending_stock",
+            "days_of_cover",
+            "markdown_priority",
+        ]
+    ]
+
+
+def build_actions(
+    reorder_priority: pd.DataFrame,
+    slow_stock_priority: pd.DataFrame,
+) -> list[str]:
+    pressure_pool = reorder_priority.loc[reorder_priority["reorder_priority"] == "High"]
+    if pressure_pool.empty:
+        pressure_pool = reorder_priority.loc[
+            reorder_priority["reorder_priority"] == "Medium"
+        ]
+    if pressure_pool.empty:
+        pressure_pool = reorder_priority.loc[reorder_priority["units_sold"] > 0]
+    pressure = (pressure_pool if not pressure_pool.empty else reorder_priority).iloc[0]
+    slow_pool = slow_stock_priority.loc[slow_stock_priority["markdown_priority"] == "High"]
+    if slow_pool.empty:
+        slow_pool = slow_stock_priority.sort_values(["units_sold", "days_of_cover"])
+    slow_names = ", ".join(slow_pool.head(3)["product_name"].tolist())
+    cover_text = (
+        f"{pressure['days_of_cover']:.1f} days of cover"
+        if pd.notna(pressure["days_of_cover"])
+        else "no recent sales cover estimate"
+    )
+    if pd.notna(pressure["days_of_cover"]):
+        reorder_action = (
+            f"Replenish {pressure['product_name']} size {pressure['size']} first: it has "
+            f"{int(pressure['stockout_sku_days'])} stockout SKU-days and {cover_text}."
+        )
+    else:
+        reorder_action = (
+            f"Confirm the inventory mapping for {pressure['product_name']} size {pressure['size']} "
+            f"before reordering; {int(pressure['units_sold'])} units sold but stock cover is unavailable."
+        )
     return [
-        f"Reorder the strongest alpha apparel size pressure point first: size {pressure['size']} has {int(pressure['stockout_sku_days'])} SKU-level stockout days and {int(pressure['units'])} sold units.",
-        f"Give front-of-store space to {top_product} and reduce new buying for {slow_product} until its sell-through improves.",
-        f"Test a small {slow_day} offer on slow-moving stock, then compare that day against the next two {slow_day}s before scaling it.",
+        reorder_action,
+        f"Review {slow_names} display, price, and next buy because low unit movement appears alongside stock remaining; test presentation before markdown.",
+        "Test a small Tuesday offer on slow-moving stock with margin tracking and compare against the next two Tuesdays before scaling.",
     ]
 
 
 def analyze() -> Analysis:
-    sales, products, inventory = load_inputs()
+    """Run the original CLI/default-file workflow."""
+    return _analyze_prepared(*load_inputs())
+
+
+def analyze_from_frames(
+    sales_df: pd.DataFrame | None = None,
+    products_df: pd.DataFrame | None = None,
+    inventory_df: pd.DataFrame | None = None,
+) -> Analysis:
+    """Analyze uploaded frames, using bundled reference files for omitted inputs."""
+    sales = prepare_sales_frame(
+        sales_df if sales_df is not None else pd.read_csv(SALES_FILE)
+    )
+    products = prepare_products_frame(
+        products_df
+        if products_df is not None
+        else (pd.read_csv(PRODUCT_FILE) if PRODUCT_FILE.exists() else None)
+    )
+    inventory = prepare_inventory_frame(
+        inventory_df
+        if inventory_df is not None
+        else (pd.read_csv(INVENTORY_FILE) if INVENTORY_FILE.exists() else None)
+    )
+    return _analyze_prepared(sales, products, inventory)
+
+
+def _analyze_prepared(
+    sales: pd.DataFrame,
+    products: pd.DataFrame | None,
+    inventory: pd.DataFrame | None,
+) -> Analysis:
     product_perf = calculate_product_performance(sales, products)
     size_perf = calculate_size_performance(sales)
     all_size_inventory = calculate_size_inventory(inventory, products, sales)
@@ -344,11 +659,12 @@ def analyze() -> Analysis:
     inventory_movement = calculate_inventory_movement(inventory)
     weekday_perf = calculate_weekday_performance(sales)
     customer_patterns = calculate_customer_patterns(sales)
-    if len(customer_patterns) < 2:
-        raise ValueError(
-            f"Category lift analysis found fewer than two patterns with at least "
-            f"{CUSTOMER_PATTERN_MIN_SUPPORT} support units"
-        )
+    reorder_priority = calculate_reorder_priority(sales, products, inventory)
+    slow_stock_priority = calculate_slow_stock_priority(
+        product_perf, sales, products, inventory
+    )
+    customer_summary = customer_pattern_summaries(customer_patterns)
+    date_range_warning = inventory_date_range_warning(sales, inventory)
 
     date_revenue = sales.groupby("date")["total_amount (Rs.)"].sum().sort_values(ascending=False)
     kpis = {
@@ -359,10 +675,11 @@ def analyze() -> Analysis:
         "date_end": sales["date"].max().date().isoformat(),
         "highest_revenue_date": date_revenue.index[0].date().isoformat(),
         "highest_revenue_date_sales": float(date_revenue.iloc[0]),
+        "inventory_date_warning": date_range_warning,
     }
     kpis["average_bill_value"] = kpis["total_revenue"] / max(kpis["transactions"], 1)
 
-    actions = build_actions(product_perf, size_inventory, weekday_perf)
+    actions = build_actions(reorder_priority, slow_stock_priority)
     top3 = product_perf.head(3)
     bottom3 = product_perf.sort_values(["units", "revenue"], ascending=[True, True]).head(3)
     strongest_day = weekday_perf.sort_values("avg_revenue_per_day", ascending=False).iloc[0]
@@ -404,19 +721,22 @@ def analyze() -> Analysis:
         "actions": actions,
     }
     return Analysis(
-        sales,
-        products,
-        inventory,
-        kpis,
-        product_perf,
-        size_perf,
-        size_inventory,
-        all_size_inventory,
-        inventory_movement,
-        weekday_perf,
-        customer_patterns,
-        actions,
-        answers,
+        sales=sales,
+        products=products,
+        inventory=inventory,
+        kpis=kpis,
+        product_perf=product_perf,
+        size_perf=size_perf,
+        size_inventory=size_inventory,
+        all_size_inventory=all_size_inventory,
+        inventory_movement=inventory_movement,
+        weekday_perf=weekday_perf,
+        customer_patterns=customer_patterns,
+        reorder_priority=reorder_priority,
+        slow_stock_priority=slow_stock_priority,
+        customer_summary=customer_summary,
+        actions=actions,
+        answers=answers,
     )
 
 
@@ -462,7 +782,8 @@ def fact_package(analysis: Analysis) -> dict:
         "weekday_performance": analysis.weekday_perf.to_dict(orient="records"),
         "customer_patterns": analysis.customer_patterns.head(5).to_dict(orient="records"),
         "inventory_movement": analysis.inventory_movement.to_dict(orient="records"),
-        "actions": analysis.actions,
+        "reorder_priority": analysis.reorder_priority.head(5).to_dict(orient="records"),
+        "slow_stock_priority": analysis.slow_stock_priority.head(5).to_dict(orient="records"),
         "guardrails": [
             "Do not invent numbers.",
             "Do not claim exact lost sales from stockouts.",
@@ -474,7 +795,20 @@ def fact_package(analysis: Analysis) -> dict:
 
 
 def sanitize_llm_text(text: str) -> str:
-    return text.replace("$", "Rs. ")
+    clean_lines = []
+    for line in text.replace("$", "Rs. ").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("|"):
+            continue
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("# ")
+        if stripped[:2] in {"- ", "* "}:
+            stripped = stripped[2:]
+        if len(stripped) > 3 and stripped[0].isdigit() and stripped[1:3] == ". ":
+            continue
+        clean_lines.append(stripped)
+    words = " ".join(clean_lines).split()
+    return " ".join(words[:180])
 
 
 def get_ai_runtime_info() -> dict:
@@ -501,10 +835,12 @@ def call_llm_if_configured(facts: dict, ai_runtime: dict) -> str | None:
         return None
 
     prompt = (
-        "Explain these verified fashion retail facts for a store manager. "
+        "Write one short manager interpretation of these verified fashion retail facts. "
         "This is an Indian fashion retail store. Use Rs. for currency, never dollars. "
-        "Use only the numbers provided. Explain the findings only; do not add an action list "
-        "because Python supplies the three approved actions separately.\n\n"
+        "Use only the numbers provided. Maximum 180 words. Use short prose paragraphs only. "
+        "Do not use markdown tables, headings, bullets, or numbered lists. Do not repeat the "
+        "full fact package. Do not add recommendations or an action list because Python "
+        "supplies exactly three approved actions separately.\n\n"
         + json.dumps(facts, default=str)
     )
     response = requests.post(
@@ -522,7 +858,33 @@ def call_llm_if_configured(facts: dict, ai_runtime: dict) -> str | None:
     )
     response.raise_for_status()
     payload = response.json()
-    return sanitize_llm_text(payload["choices"][0]["message"]["content"].strip())
+    cleaned = sanitize_llm_text(payload["choices"][0]["message"]["content"].strip())
+    return cleaned or None
+
+
+def deterministic_manager_explanation(analysis: Analysis) -> str:
+    top = analysis.product_perf.iloc[0]
+    slow = analysis.slow_stock_priority.iloc[0]
+    pressure = analysis.reorder_priority.iloc[0]
+    strongest = analysis.weekday_perf.sort_values("avg_revenue_per_day", ascending=False).iloc[0]
+    pattern_text = (
+        " ".join(analysis.customer_summary)
+        if analysis.customer_summary
+        else "This sales file has no customer-category lift above the support threshold."
+    )
+    cover_text = (
+        f"{pressure['days_of_cover']:.1f} days of cover"
+        if pd.notna(pressure["days_of_cover"])
+        else "no reliable cover estimate"
+    )
+    return (
+        f"{top['product_name']} leads unit sales, while {slow['product_name']} needs closer "
+        f"sell-through review. The clearest replenishment pressure is {pressure['product_name']} "
+        f"size {pressure['size']}, with {int(pressure['stockout_sku_days'])} stockout SKU-days "
+        f"and {cover_text}. {strongest['day_of_week']} has the strongest average revenue per "
+        f"trading day. {pattern_text} These customer patterns are merchandising test signals, "
+        "not demographic truth."
+    )
 
 
 def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
@@ -538,10 +900,15 @@ def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
             )
         elif column == "lift":
             view[column] = view[column].map(lambda value: f"{value:.2f}x")
+        elif column in {"days_of_cover", "recent_daily_velocity"}:
+            view[column] = view[column].map(
+                lambda value: "N/A" if pd.isna(value) else f"{value:,.1f}"
+            )
         elif pd.api.types.is_float_dtype(view[column]):
             view[column] = view[column].map(lambda value: f"{value:,.0f}")
     label_map = {
         "product_name": "Product",
+        "units_sold": "Units Sold",
         "gross_margin_rs": "Gross Margin (Rs.)",
         "gross_margin_pct": "Gross Margin (%)",
         "revenue_share_pct": "Revenue Share (%)",
@@ -555,6 +922,11 @@ def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
         "expected_closing": "Expected Closing",
         "closing_stock": "Closing Stock",
         "reconciliation_difference": "Reconciliation Difference",
+        "recent_daily_velocity": "Recent Daily Velocity",
+        "days_of_cover": "Days of Cover",
+        "reorder_priority": "Reorder Priority",
+        "markdown_priority": "Markdown Priority",
+        "manager_interpretation": "Manager Interpretation",
     }
     labels = [label_map.get(column, column.replace("_", " ").title()) for column in view.columns]
     lines = [
@@ -568,24 +940,19 @@ def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
 
 def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: dict) -> str:
     top3 = analysis.product_perf.head(3)
-    bottom3 = analysis.product_perf.sort_values(["units", "revenue"], ascending=[True, True]).head(3)
+    bottom3 = analysis.product_perf.sort_values(["units", "revenue"]).head(3)
     pressure = analysis.answers["size_inventory"]["pressure_size"]
     barely = analysis.answers["size_inventory"]["barely_size"]
     strongest = analysis.answers["trading_days"]["strongest"]
     slowest = analysis.answers["trading_days"]["slowest"]
-
-    bottom_lines = []
-    for row in bottom3.itertuples(index=False):
-        bottom_lines.append(f"- {row.product_name}: {int(row.units)} units, {money(row.revenue)} revenue; possible reason: {stock_notes_for_product(row.product_name, analysis.sales, analysis.inventory)}.")
-
+    explanation = llm_text or deterministic_manager_explanation(analysis)
     action_lines = [f"{index}. {action}" for index, action in enumerate(analysis.actions, start=1)]
     product_columns = [
         "product_name",
         "units",
         "revenue",
-        "gross_margin_rs",
         "gross_margin_pct",
-        "revenue_share_pct",
+        "manager_interpretation",
     ]
     pattern_columns = [
         "segment",
@@ -594,7 +961,6 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: 
         "store_share_pct",
         "lift",
         "support_units",
-        "business_meaning",
     ]
     movement_columns = [
         "opening_stock",
@@ -606,6 +972,41 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: 
         "closing_stock",
         "reconciliation_difference",
     ]
+    reorder_columns = [
+        "product_name",
+        "size",
+        "units_sold",
+        "stockout_sku_days",
+        "ending_stock",
+        "recent_daily_velocity",
+        "days_of_cover",
+        "reorder_priority",
+    ]
+    slow_columns = [
+        "product_name",
+        "units_sold",
+        "revenue",
+        "gross_margin_pct",
+        "ending_stock",
+        "days_of_cover",
+        "markdown_priority",
+    ]
+    summary_lines = (
+        [f"- {sentence}" for sentence in analysis.customer_summary]
+        if analysis.customer_summary
+        else ["- No customer-category lift met the minimum support threshold in this sales file."]
+    )
+    unknown_count = len(missing_product_skus(analysis.sales, analysis.products))
+    partial_note = (
+        f"- {unknown_count} sales SKU(s) were not present in the active product master, so margin and inventory metrics may be partial."
+        if unknown_count
+        else "- Sales SKUs matched the active product master."
+    )
+    inventory_date_note = (
+        [f"- {analysis.kpis['inventory_date_warning']}"]
+        if analysis.kpis.get("inventory_date_warning")
+        else []
+    )
 
     return "\n".join(
         [
@@ -615,10 +1016,13 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: 
             f"- Period analysed: {analysis.kpis['date_start']} to {analysis.kpis['date_end']}.",
             f"- Revenue: {money(analysis.kpis['total_revenue'])}; units sold: {analysis.kpis['total_units']:,}; invoices: {analysis.kpis['transactions']:,}.",
             f"- Average bill value: {money(analysis.kpis['average_bill_value'])}.",
-            f"- Highest revenue calendar date: {analysis.kpis['highest_revenue_date']} with {money(analysis.kpis['highest_revenue_date_sales'])}.",
+            f"- Highest revenue date: {analysis.kpis['highest_revenue_date']} with {money(analysis.kpis['highest_revenue_date_sales'])}.",
+            partial_note,
+            *inventory_date_note,
             "",
             "## Question 1 Product Performance",
             "Gross margin is revenue less product cost from product_master.csv; it is not net profit.",
+            "High volume + healthy margin means protect availability. Low volume + weak margin means review buying/markdown. Low volume + high margin means test display or bundling before discount.",
             "",
             "Top 3 products by units sold:",
             markdown_table(top3, product_columns),
@@ -626,82 +1030,80 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: 
             "Bottom 3 products by units sold:",
             markdown_table(bottom3, product_columns),
             "",
-            "Evidence notes for the slowest products:",
-            "\n".join(bottom_lines),
-            "",
             "## Question 2 Size and Inventory",
-            "- Assignment size demand is calculated only for alpha apparel sizes: XS, S, M, L, and XL.",
-            f"- Size {pressure['size']} shows the strongest alpha apparel stock pressure: {int(pressure['units'])} units sold and {int(pressure['stockout_sku_days'])} SKU-level stockout days.",
-            f"- Size {barely['size']} is the slowest alpha apparel size: {int(barely['units'])} units sold and about {barely['days_of_cover']:.1f} days of cover at the end of the period.",
-            f"- Order more depth for size {pressure['size']} in proven fast products, and order less new depth for size {barely['size']} until movement improves.",
+            "- Alpha apparel size demand covers XS, S, M, L, and XL only.",
+            f"- Size {pressure['size']} has the strongest size pressure: {int(pressure['units'])} units sold and {int(pressure['stockout_sku_days'])} stockout SKU-days.",
+            f"- Size {barely['size']} is the slowest alpha size: {int(barely['units'])} units sold and about {barely['days_of_cover']:.1f} days of cover.",
             f"- {OTHER_SIZE_SYSTEM_NOTE}",
             "",
             "## Question 3 Trading Days",
-            f"- Strongest weekday: {strongest['day_of_week']} with {money(strongest['avg_revenue_per_day'])} average revenue per trading day.",
-            f"- Slowest weekday: {slowest['day_of_week']} with {money(slowest['avg_revenue_per_day'])} average revenue per trading day.",
-            "- A small slow-day offer is worth testing, but the result should be measured against later same-weekday trading because this data does not prove promotion causality.",
+            f"- Strongest weekday: {strongest['day_of_week']} at {money(strongest['avg_revenue_per_day'])} average revenue per trading day.",
+            f"- Slowest weekday: {slowest['day_of_week']} at {money(slowest['avg_revenue_per_day'])} average revenue per trading day.",
+            "- Test a small Tuesday offer on slow-moving stock with margin tracking and compare against the next two Tuesdays before scaling; no sales increase is assumed.",
             "",
             "## Question 4 Customer Patterns",
-            f"Category lift compares each segment's category share with the overall store category share. Only patterns with at least {CUSTOMER_PATTERN_MIN_SUPPORT} support units are shown.",
+            f"Lift compares each segment's category share with the overall store share. Patterns shown have at least {CUSTOMER_PATTERN_MIN_SUPPORT} support units.",
             "",
             markdown_table(analysis.customer_patterns.head(5), pattern_columns),
             "",
-            "- These are simulated monthly patterns and not real demographic claims.",
+            "\n".join(summary_lines),
+            "- These are merchandising test signals, not demographic truth.",
             "",
             "## Question 5 Exactly 3 Actions for Next Week",
             "\n".join(action_lines),
             "",
             "## Inventory Movement Check",
             "Expected closing = opening stock + received stock + returns + adjustments - sold units.",
-            "Returns and adjustments are included explicitly in stock movement, even when their value is zero for this monthly dataset.",
-            "",
             markdown_table(analysis.inventory_movement, movement_columns),
             "",
-            "## AI Manager Explanation",
-            llm_text if llm_text else REPORT_FALLBACK_EXPLANATION,
+            "## Reorder Priority",
+            "Recent daily velocity uses the final 7 calendar days available in the sales month.",
+            markdown_table(analysis.reorder_priority.head(10), reorder_columns),
+            "",
+            "## Slow Stock / Markdown Priority",
+            "Review display/price first; markdown only if stock remains slow.",
+            markdown_table(analysis.slow_stock_priority.head(10), slow_columns),
             "",
             "## AI Usage Transparency",
-            "- Python calculated all numbers.",
-            "- AI only explained verified facts.",
-            f"- Model used: {ai_runtime['model']} via {ai_runtime['provider']}.",
-            f"- Temperature: {ai_runtime['temperature']}.",
-            "- A deterministic fallback is available when the API is not configured or unavailable.",
-            "- No API key is written to report outputs.",
+            "Manager interpretation (maximum 180 words):",
+            explanation,
+            "",
+            "- Python calculated all numbers and exactly three actions.",
+            "- AI, when configured, only interpreted verified facts.",
+            f"- Model metadata: {ai_runtime['model']} via {ai_runtime['provider']}; temperature {ai_runtime['temperature']}.",
+            "- A deterministic fallback is used when the API is not configured or unavailable.",
+            "- No API key or technical service detail is written to outputs.",
             "",
             "## Limitations",
-            "- Stockout evidence is counted at SKU level and does not mean a whole size was unavailable.",
-            "- Slow products may reflect demand, display, price, or stock depth; this report gives evidence-backed possibilities, not certainty.",
-            "- Gross margin is estimated from item cost data where available and is not net profit.",
-            "- Customer lift indicates association within one simulated month, not causation or real demographic truth.",
+            "- Stockout evidence is SKU-level and does not prove a whole size was unavailable or quantify lost sales.",
+            "- Slow movement can reflect demand, display, price, or stock depth; priority labels are review signals.",
+            "- Gross margin is estimated from available item cost data and is not net profit.",
+            "- Customer lift is association within one month, not causation or demographic truth.",
             "",
         ]
     )
 
 
 def write_ai_insights(analysis: Analysis, llm_text: str | None, ai_runtime: dict) -> None:
-    facts = fact_package(analysis)
+    explanation = llm_text or deterministic_manager_explanation(analysis)
     lines = [
         "# AI Manager Insights",
         "",
-        "## AI Usage Transparency",
-        "Python calculated all numbers.",
-        "AI only explained verified facts.",
-        f"Model used: {ai_runtime['model']}.",
-        f"Provider: {ai_runtime['provider']}.",
-        "A deterministic fallback is available when the API is not configured or unavailable.",
-        "",
-        "## Verified Facts Sent to LLM",
-        f"- Revenue: {money(facts['kpis']['total_revenue'])}",
-        f"- Units sold: {facts['kpis']['total_units']:,}",
-        f"- Top products: {', '.join(row['product_name'] for row in facts['top_products'])}",
-        f"- Bottom products: {', '.join(row['product_name'] for row in facts['bottom_products'])}",
-        "",
         "## Manager Explanation",
-        llm_text or AI_INSIGHTS_FALLBACK_EXPLANATION,
+        explanation,
         "",
         "## Exactly 3 Actions",
     ]
     lines.extend(f"{index}. {action}" for index, action in enumerate(analysis.actions, start=1))
+    lines.extend(
+        [
+            "",
+            "## AI Usage Transparency",
+            "Python calculated all numbers and the three actions.",
+            f"Model metadata: {ai_runtime['model']} via {ai_runtime['provider']}.",
+            "No API key or technical service detail is written to this file.",
+        ]
+    )
     (OUTPUT_DIR / "ai_manager_insights.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -720,6 +1122,26 @@ def write_ai_run_metadata(ai_runtime: dict) -> None:
     (OUTPUT_DIR / "ai_run_metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def generate_outputs(analysis: Analysis) -> tuple[str, dict]:
+    """Regenerate charts, Markdown, PDF, and AI metadata for one analysis run."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    CHART_DIR.mkdir(parents=True, exist_ok=True)
+    generate_charts(analysis)
+    ai_runtime = get_ai_runtime_info()
+    try:
+        llm_text = call_llm_if_configured(fact_package(analysis), ai_runtime)
+    except Exception:
+        print("WARNING: AI explanation unavailable; deterministic explanation used.")
+        llm_text = None
+    explanation = llm_text or deterministic_manager_explanation(analysis)
+    report = build_report_markdown(analysis, explanation, ai_runtime)
+    (OUTPUT_DIR / "store_report.md").write_text(report, encoding="utf-8")
+    write_ai_insights(analysis, explanation, ai_runtime)
+    write_ai_run_metadata(ai_runtime)
+    write_pdf(report)
+    return explanation, ai_runtime
 
 
 def write_pdf(markdown_text: str) -> None:
@@ -767,6 +1189,12 @@ def write_pdf(markdown_text: str) -> None:
     def table_widths(headers: list[str]) -> list[float]:
         if "Business Meaning" in headers:
             weights = [1.7, 1.0, 0.9, 0.9, 0.6, 0.8, 2.5]
+        elif "Manager Interpretation" in headers:
+            weights = [1.6, 0.5, 0.8, 0.8, 2.7]
+        elif "Reorder Priority" in headers:
+            weights = [1.7, 0.5, 0.7, 0.9, 0.8, 1.0, 0.8, 0.9]
+        elif "Markdown Priority" in headers:
+            weights = [1.8, 0.7, 0.9, 0.9, 0.8, 0.8, 1.0]
         elif "Gross Margin (Rs.)" in headers:
             weights = [2.1, 0.7, 1.0, 1.2, 1.0, 1.0]
         else:
@@ -863,22 +1291,8 @@ def print_terminal_answers(analysis: Analysis) -> None:
 
 
 def main() -> int:
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    CHART_DIR.mkdir(parents=True, exist_ok=True)
     analysis = analyze()
-    generate_charts(analysis)
-    facts = fact_package(analysis)
-    ai_runtime = get_ai_runtime_info()
-    try:
-        llm_text = call_llm_if_configured(facts, ai_runtime)
-    except Exception as exc:
-        print(f"WARNING: LLM request failed; deterministic explanations were used. Technical detail: {exc}")
-        llm_text = None
-    report = build_report_markdown(analysis, llm_text, ai_runtime)
-    (OUTPUT_DIR / "store_report.md").write_text(report, encoding="utf-8")
-    write_ai_insights(analysis, llm_text, ai_runtime)
-    write_ai_run_metadata(ai_runtime)
-    write_pdf(report)
+    generate_outputs(analysis)
     print_terminal_answers(analysis)
     print("\nGenerated outputs/store_report.md")
     print("Generated outputs/store_report.pdf")
