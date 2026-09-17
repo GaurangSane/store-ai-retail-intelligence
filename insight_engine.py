@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
-from textwrap import wrap
 
 import matplotlib
 
@@ -15,9 +15,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 try:
     from dotenv import load_dotenv
@@ -40,6 +42,10 @@ OTHER_SIZE_SYSTEM_NOTE = (
     "Other size systems such as footwear/kids/OneSize are excluded from the assignment "
     "size chart to avoid mixing size systems."
 )
+DEFAULT_LLM_MODEL = "openai/gpt-oss-20b"
+DEFAULT_LLM_PROVIDER = "Groq OpenAI-compatible API"
+LLM_TEMPERATURE = 0.2
+CUSTOMER_PATTERN_MIN_SUPPORT = 40
 
 REPORT_FALLBACK_EXPLANATION = (
     "This explanation was generated from deterministic Python-calculated facts. "
@@ -73,6 +79,7 @@ class Analysis:
     size_perf: pd.DataFrame
     size_inventory: pd.DataFrame
     all_size_inventory: pd.DataFrame
+    inventory_movement: pd.DataFrame
     weekday_perf: pd.DataFrame
     customer_patterns: pd.DataFrame
     actions: list[str]
@@ -97,7 +104,30 @@ def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | Non
     inventory = pd.read_csv(INVENTORY_FILE) if INVENTORY_FILE.exists() else None
     if inventory is not None:
         inventory["date"] = pd.to_datetime(inventory["date"], errors="raise")
-        for column in ["opening_stock", "stock_received", "quantity_sold", "closing_stock"]:
+        required_inventory_columns = {
+            "date",
+            "sku_id",
+            "opening_stock",
+            "stock_received",
+            "returns",
+            "adjustments",
+            "quantity_sold",
+            "closing_stock",
+        }
+        missing_inventory = required_inventory_columns - set(inventory.columns)
+        if missing_inventory:
+            raise ValueError(
+                "inventory_daily.csv is missing required columns: "
+                + ", ".join(sorted(missing_inventory))
+            )
+        for column in [
+            "opening_stock",
+            "stock_received",
+            "returns",
+            "adjustments",
+            "quantity_sold",
+            "closing_stock",
+        ]:
             inventory[column] = pd.to_numeric(inventory[column], errors="coerce").fillna(0)
     return sales, products, inventory
 
@@ -108,14 +138,64 @@ def calculate_product_performance(sales: pd.DataFrame, products: pd.DataFrame | 
         revenue=("total_amount (Rs.)", "sum"),
         transactions=("sale_id", "count") if "sale_id" in sales.columns else ("sku_id", "count"),
     )
-    if products is not None and {"product_name", "cost_price"}.issubset(products.columns):
-        cost = products.groupby("product_name", as_index=False).agg(avg_cost=("cost_price", "mean"))
-        grouped = grouped.merge(cost, on="product_name", how="left")
-        grouped["gross_margin_rs"] = grouped["revenue"] - grouped["units"] * grouped["avg_cost"].fillna(0)
+    if products is not None and {"sku_id", "cost_price"}.issubset(products.columns):
+        sku_costs = products[["sku_id", "cost_price"]].drop_duplicates("sku_id").copy()
+        sku_costs["cost_price"] = pd.to_numeric(sku_costs["cost_price"], errors="coerce")
+        costed_sales = sales[["sku_id", "product_name", "quantity_sold"]].merge(
+            sku_costs, on="sku_id", how="left", validate="many_to_one"
+        )
+        costed_sales["line_cogs"] = costed_sales["quantity_sold"] * costed_sales["cost_price"]
+        cost_summary = costed_sales.groupby("product_name", as_index=False).agg(
+            cogs=("line_cogs", lambda values: values.sum(min_count=1)),
+            missing_costs=("cost_price", lambda values: int(values.isna().sum())),
+        )
+        grouped = grouped.merge(cost_summary, on="product_name", how="left")
+        grouped["gross_margin_rs"] = grouped["revenue"] - grouped["cogs"]
+        grouped.loc[grouped["missing_costs"].gt(0), "gross_margin_rs"] = float("nan")
     else:
-        grouped["gross_margin_rs"] = 0
+        grouped["gross_margin_rs"] = float("nan")
+    grouped["gross_margin_pct"] = grouped["gross_margin_rs"].div(grouped["revenue"]).mul(100)
     grouped["revenue_share_pct"] = grouped["revenue"] / grouped["revenue"].sum() * 100
     return grouped.sort_values(["units", "revenue"], ascending=[False, False]).reset_index(drop=True)
+
+
+def calculate_inventory_movement(inventory: pd.DataFrame | None) -> pd.DataFrame:
+    columns = [
+        "opening_stock",
+        "stock_received",
+        "returns",
+        "adjustments",
+        "quantity_sold",
+        "expected_closing",
+        "closing_stock",
+        "reconciliation_difference",
+    ]
+    if inventory is None or inventory.empty:
+        return pd.DataFrame(columns=columns)
+
+    ordered = inventory.sort_values(["sku_id", "date"])
+    opening_stock = float(ordered.groupby("sku_id", sort=False)["opening_stock"].first().sum())
+    closing_stock = float(ordered.groupby("sku_id", sort=False)["closing_stock"].last().sum())
+    stock_received = float(ordered["stock_received"].sum())
+    returns = float(ordered["returns"].sum())
+    adjustments = float(ordered["adjustments"].sum())
+    quantity_sold = float(ordered["quantity_sold"].sum())
+    expected_closing = opening_stock + stock_received + returns + adjustments - quantity_sold
+    return pd.DataFrame(
+        [
+            {
+                "opening_stock": opening_stock,
+                "stock_received": stock_received,
+                "returns": returns,
+                "adjustments": adjustments,
+                "quantity_sold": quantity_sold,
+                "expected_closing": expected_closing,
+                "closing_stock": closing_stock,
+                "reconciliation_difference": closing_stock - expected_closing,
+            }
+        ],
+        columns=columns,
+    )
 
 
 def calculate_size_performance(sales: pd.DataFrame) -> pd.DataFrame:
@@ -177,21 +257,58 @@ def calculate_weekday_performance(sales: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_customer_patterns(sales: pd.DataFrame) -> pd.DataFrame:
-    pattern_column = "category" if "category" in sales.columns else "product_name"
+    if "category" not in sales.columns:
+        raise ValueError("sales_data.csv must include category for customer category lift analysis")
+
+    segment_categories = sales.groupby(
+        ["customer_gender", "age_group", "category"], as_index=False
+    ).agg(support_units=("quantity_sold", "sum"))
+    segment_totals = sales.groupby(["customer_gender", "age_group"], as_index=False).agg(
+        segment_units=("quantity_sold", "sum")
+    )
+    store_categories = sales.groupby("category", as_index=False).agg(
+        store_category_units=("quantity_sold", "sum")
+    )
+    store_units = float(sales["quantity_sold"].sum())
+
+    patterns = segment_categories.merge(
+        segment_totals, on=["customer_gender", "age_group"], how="left"
+    ).merge(store_categories, on="category", how="left")
+    patterns["segment_share_pct"] = patterns["support_units"] / patterns["segment_units"] * 100
+    patterns["store_share_pct"] = patterns["store_category_units"] / store_units * 100
+    patterns["lift"] = patterns["segment_share_pct"] / patterns["store_share_pct"]
+    patterns["segment"] = patterns["customer_gender"] + " - " + patterns["age_group"]
+    patterns["business_meaning"] = patterns.apply(
+        lambda row: (
+            f"{row['category']} takes {row['lift']:.2f}x its store-average share in this segment; "
+            "use this as a merchandising test signal."
+        ),
+        axis=1,
+    )
     return (
-        sales.groupby(["customer_gender", "age_group", pattern_column], as_index=False)
-        .agg(units=("quantity_sold", "sum"), revenue=("total_amount (Rs.)", "sum"))
-        .sort_values(["units", "revenue"], ascending=[False, False])
-        .head(5)
+        patterns.loc[
+            patterns["support_units"].ge(CUSTOMER_PATTERN_MIN_SUPPORT) & patterns["lift"].gt(1),
+            [
+                "segment",
+                "category",
+                "segment_share_pct",
+                "store_share_pct",
+                "lift",
+                "support_units",
+                "business_meaning",
+            ],
+        ]
+        .sort_values(["lift", "support_units"], ascending=[False, False])
         .reset_index(drop=True)
     )
 
 
 def customer_pattern_sentence(row) -> str:
-    segment = f"{row.age_group} {row.customer_gender}".replace("Young Adult (20-30)", "Young Adult").replace("Adult (31-45)", "Adult")
-    if hasattr(row, "category"):
-        return f"{segment} customers bought more {row.category} in this simulated month: {int(row.units)} units, {money(row.revenue)} revenue."
-    return f"{segment} customers bought more {row.product_name} in this simulated month: {int(row.units)} units, {money(row.revenue)} revenue."
+    return (
+        f"{row.segment}: {row.category} was {row.segment_share_pct:.1f}% of segment units versus "
+        f"{row.store_share_pct:.1f}% store-wide ({row.lift:.2f}x lift; "
+        f"{int(row.support_units)} support units)."
+    )
 
 
 def stock_notes_for_product(product: str, sales: pd.DataFrame, inventory: pd.DataFrame | None) -> str:
@@ -224,8 +341,14 @@ def analyze() -> Analysis:
     size_perf = calculate_size_performance(sales)
     all_size_inventory = calculate_size_inventory(inventory, products, sales)
     size_inventory = alpha_size_inventory(all_size_inventory)
+    inventory_movement = calculate_inventory_movement(inventory)
     weekday_perf = calculate_weekday_performance(sales)
     customer_patterns = calculate_customer_patterns(sales)
+    if len(customer_patterns) < 2:
+        raise ValueError(
+            f"Category lift analysis found fewer than two patterns with at least "
+            f"{CUSTOMER_PATTERN_MIN_SUPPORT} support units"
+        )
 
     date_revenue = sales.groupby("date")["total_amount (Rs.)"].sum().sort_values(ascending=False)
     kpis = {
@@ -280,7 +403,21 @@ def analyze() -> Analysis:
         "customer_patterns": customer_patterns.head(2),
         "actions": actions,
     }
-    return Analysis(sales, products, inventory, kpis, product_perf, size_perf, size_inventory, all_size_inventory, weekday_perf, customer_patterns, actions, answers)
+    return Analysis(
+        sales,
+        products,
+        inventory,
+        kpis,
+        product_perf,
+        size_perf,
+        size_inventory,
+        all_size_inventory,
+        inventory_movement,
+        weekday_perf,
+        customer_patterns,
+        actions,
+        answers,
+    )
 
 
 def generate_charts(analysis: Analysis) -> None:
@@ -324,6 +461,7 @@ def fact_package(analysis: Analysis) -> dict:
         "other_size_system_note": OTHER_SIZE_SYSTEM_NOTE,
         "weekday_performance": analysis.weekday_perf.to_dict(orient="records"),
         "customer_patterns": analysis.customer_patterns.head(5).to_dict(orient="records"),
+        "inventory_movement": analysis.inventory_movement.to_dict(orient="records"),
         "actions": analysis.actions,
         "guardrails": [
             "Do not invent numbers.",
@@ -339,30 +477,46 @@ def sanitize_llm_text(text: str) -> str:
     return text.replace("$", "Rs. ")
 
 
-def call_llm_if_configured(facts: dict) -> str | None:
+def get_ai_runtime_info() -> dict:
     load_dotenv(PROJECT_ROOT / ".env")
-    api_url = os.getenv("LLM_API_URL")
-    model = os.getenv("LLM_MODEL")
+    api_url = os.getenv("LLM_API_URL", "")
+    configured_provider = os.getenv("LLM_PROVIDER", "")
+    if "groq.com" in api_url.lower():
+        provider = DEFAULT_LLM_PROVIDER
+    elif configured_provider:
+        provider = configured_provider.replace("_", " ").strip()
+    else:
+        provider = DEFAULT_LLM_PROVIDER
+    return {
+        "provider": provider,
+        "model": os.getenv("LLM_MODEL") or DEFAULT_LLM_MODEL,
+        "api_url": api_url,
+        "temperature": LLM_TEMPERATURE,
+    }
+
+
+def call_llm_if_configured(facts: dict, ai_runtime: dict) -> str | None:
     api_key = os.getenv("LLM_API_KEY")
-    if not api_url or not model or not api_key or api_key == "your_api_key_here":
+    if not ai_runtime["api_url"] or not api_key or api_key == "your_api_key_here":
         return None
 
     prompt = (
         "Explain these verified fashion retail facts for a store manager. "
         "This is an Indian fashion retail store. Use Rs. for currency, never dollars. "
-        "Use only the numbers provided. Keep the answer practical and include exactly three actions.\n\n"
+        "Use only the numbers provided. Explain the findings only; do not add an action list "
+        "because Python supplies the three approved actions separately.\n\n"
         + json.dumps(facts, default=str)
     )
     response = requests.post(
-        api_url,
+        ai_runtime["api_url"],
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
-            "model": model,
+            "model": ai_runtime["model"],
             "messages": [
                 {"role": "system", "content": "You explain verified retail analytics without inventing facts."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": ai_runtime["temperature"],
         },
         timeout=45,
     )
@@ -374,9 +528,35 @@ def call_llm_if_configured(facts: dict) -> str | None:
 def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
     view = df.loc[:, columns].copy()
     for column in view.columns:
-        if pd.api.types.is_float_dtype(view[column]):
+        if column in {"revenue", "gross_margin_rs"}:
+            view[column] = view[column].map(
+                lambda value: "N/A" if pd.isna(value) else f"{value:,.0f}"
+            )
+        elif column in {"segment_share_pct", "store_share_pct", "gross_margin_pct", "revenue_share_pct"}:
+            view[column] = view[column].map(
+                lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
+            )
+        elif column == "lift":
+            view[column] = view[column].map(lambda value: f"{value:.2f}x")
+        elif pd.api.types.is_float_dtype(view[column]):
             view[column] = view[column].map(lambda value: f"{value:,.0f}")
-    labels = [column.replace("_", " ").title() for column in view.columns]
+    label_map = {
+        "product_name": "Product",
+        "gross_margin_rs": "Gross Margin (Rs.)",
+        "gross_margin_pct": "Gross Margin (%)",
+        "revenue_share_pct": "Revenue Share (%)",
+        "segment_share_pct": "Segment Share %",
+        "store_share_pct": "Store Share %",
+        "support_units": "Support Units",
+        "business_meaning": "Business Meaning",
+        "opening_stock": "Opening Stock",
+        "stock_received": "Received Stock",
+        "quantity_sold": "Sold Units",
+        "expected_closing": "Expected Closing",
+        "closing_stock": "Closing Stock",
+        "reconciliation_difference": "Reconciliation Difference",
+    }
+    labels = [label_map.get(column, column.replace("_", " ").title()) for column in view.columns]
     lines = [
         "| " + " | ".join(labels) + " |",
         "| " + " | ".join(["---"] * len(labels)) + " |",
@@ -386,7 +566,7 @@ def markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
     return "\n".join(lines)
 
 
-def build_report_markdown(analysis: Analysis, llm_text: str | None) -> str:
+def build_report_markdown(analysis: Analysis, llm_text: str | None, ai_runtime: dict) -> str:
     top3 = analysis.product_perf.head(3)
     bottom3 = analysis.product_perf.sort_values(["units", "revenue"], ascending=[True, True]).head(3)
     pressure = analysis.answers["size_inventory"]["pressure_size"]
@@ -398,11 +578,34 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None) -> str:
     for row in bottom3.itertuples(index=False):
         bottom_lines.append(f"- {row.product_name}: {int(row.units)} units, {money(row.revenue)} revenue; possible reason: {stock_notes_for_product(row.product_name, analysis.sales, analysis.inventory)}.")
 
-    customer_lines = []
-    for row in analysis.customer_patterns.head(2).itertuples(index=False):
-        customer_lines.append(f"- {customer_pattern_sentence(row)}")
-
     action_lines = [f"{index}. {action}" for index, action in enumerate(analysis.actions, start=1)]
+    product_columns = [
+        "product_name",
+        "units",
+        "revenue",
+        "gross_margin_rs",
+        "gross_margin_pct",
+        "revenue_share_pct",
+    ]
+    pattern_columns = [
+        "segment",
+        "category",
+        "segment_share_pct",
+        "store_share_pct",
+        "lift",
+        "support_units",
+        "business_meaning",
+    ]
+    movement_columns = [
+        "opening_stock",
+        "stock_received",
+        "returns",
+        "adjustments",
+        "quantity_sold",
+        "expected_closing",
+        "closing_stock",
+        "reconciliation_difference",
+    ]
 
     return "\n".join(
         [
@@ -414,51 +617,78 @@ def build_report_markdown(analysis: Analysis, llm_text: str | None) -> str:
             f"- Average bill value: {money(analysis.kpis['average_bill_value'])}.",
             f"- Highest revenue calendar date: {analysis.kpis['highest_revenue_date']} with {money(analysis.kpis['highest_revenue_date_sales'])}.",
             "",
-            "## Question 1: Product Performance",
+            "## Question 1 Product Performance",
+            "Gross margin is revenue less product cost from product_master.csv; it is not net profit.",
+            "",
             "Top 3 products by units sold:",
-            markdown_table(top3, ["product_name", "units", "revenue", "revenue_share_pct"]),
+            markdown_table(top3, product_columns),
             "",
             "Bottom 3 products by units sold:",
+            markdown_table(bottom3, product_columns),
+            "",
+            "Evidence notes for the slowest products:",
             "\n".join(bottom_lines),
             "",
-            "## Question 2: Size and Inventory",
+            "## Question 2 Size and Inventory",
             "- Assignment size demand is calculated only for alpha apparel sizes: XS, S, M, L, and XL.",
             f"- Size {pressure['size']} shows the strongest alpha apparel stock pressure: {int(pressure['units'])} units sold and {int(pressure['stockout_sku_days'])} SKU-level stockout days.",
             f"- Size {barely['size']} is the slowest alpha apparel size: {int(barely['units'])} units sold and about {barely['days_of_cover']:.1f} days of cover at the end of the period.",
             f"- Order more depth for size {pressure['size']} in proven fast products, and order less new depth for size {barely['size']} until movement improves.",
             f"- {OTHER_SIZE_SYSTEM_NOTE}",
             "",
-            "## Question 3: Trading Days",
+            "## Question 3 Trading Days",
             f"- Strongest weekday: {strongest['day_of_week']} with {money(strongest['avg_revenue_per_day'])} average revenue per trading day.",
             f"- Slowest weekday: {slowest['day_of_week']} with {money(slowest['avg_revenue_per_day'])} average revenue per trading day.",
             "- A small slow-day offer is worth testing, but the result should be measured against later same-weekday trading because this data does not prove promotion causality.",
             "",
-            "## Question 4: Customer Patterns",
-            "\n".join(customer_lines),
-            "- These are simulated assignment patterns and should not be generalized to real Pune shoppers.",
+            "## Question 4 Customer Patterns",
+            f"Category lift compares each segment's category share with the overall store category share. Only patterns with at least {CUSTOMER_PATTERN_MIN_SUPPORT} support units are shown.",
             "",
-            "## Question 5: Exactly 3 Actions for Next Week",
+            markdown_table(analysis.customer_patterns.head(5), pattern_columns),
+            "",
+            "- These are simulated monthly patterns and not real demographic claims.",
+            "",
+            "## Question 5 Exactly 3 Actions for Next Week",
             "\n".join(action_lines),
+            "",
+            "## Inventory Movement Check",
+            "Expected closing = opening stock + received stock + returns + adjustments - sold units.",
+            "Returns and adjustments are included explicitly in stock movement, even when their value is zero for this monthly dataset.",
+            "",
+            markdown_table(analysis.inventory_movement, movement_columns),
             "",
             "## AI Manager Explanation",
             llm_text if llm_text else REPORT_FALLBACK_EXPLANATION,
+            "",
+            "## AI Usage Transparency",
+            "- Python calculated all numbers.",
+            "- AI only explained verified facts.",
+            f"- Model used: {ai_runtime['model']} via {ai_runtime['provider']}.",
+            f"- Temperature: {ai_runtime['temperature']}.",
+            "- A deterministic fallback is available when the API is not configured or unavailable.",
+            "- No API key is written to report outputs.",
             "",
             "## Limitations",
             "- Stockout evidence is counted at SKU level and does not mean a whole size was unavailable.",
             "- Slow products may reflect demand, display, price, or stock depth; this report gives evidence-backed possibilities, not certainty.",
             "- Gross margin is estimated from item cost data where available and is not net profit.",
-            "- The dataset is assignment data, so customer patterns are useful for practice decisions but not demographic truth.",
+            "- Customer lift indicates association within one simulated month, not causation or real demographic truth.",
             "",
         ]
     )
 
 
-def write_ai_insights(analysis: Analysis, llm_text: str | None) -> None:
+def write_ai_insights(analysis: Analysis, llm_text: str | None, ai_runtime: dict) -> None:
     facts = fact_package(analysis)
     lines = [
         "# AI Manager Insights",
         "",
-        "Python calculated the facts below. The LLM, if configured, only explains these verified facts.",
+        "## AI Usage Transparency",
+        "Python calculated all numbers.",
+        "AI only explained verified facts.",
+        f"Model used: {ai_runtime['model']}.",
+        f"Provider: {ai_runtime['provider']}.",
+        "A deterministic fallback is available when the API is not configured or unavailable.",
         "",
         "## Verified Facts Sent to LLM",
         f"- Revenue: {money(facts['kpis']['total_revenue'])}",
@@ -475,28 +705,143 @@ def write_ai_insights(analysis: Analysis, llm_text: str | None) -> None:
     (OUTPUT_DIR / "ai_manager_insights.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_ai_run_metadata(ai_runtime: dict) -> None:
+    metadata = {
+        "provider": ai_runtime["provider"],
+        "model": ai_runtime["model"],
+        "ai_used_for": "Explaining verified Python-calculated retail facts only",
+        "python_used_for": (
+            "All calculations, category lift, inventory reconciliation, action selection, "
+            "tables, charts, and report generation"
+        ),
+        "temperature": ai_runtime["temperature"],
+        "fallback_available": True,
+    }
+    (OUTPUT_DIR / "ai_run_metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def write_pdf(markdown_text: str) -> None:
     styles = getSampleStyleSheet()
     styles["Title"].textColor = colors.HexColor("#243b53")
     styles["Heading2"].textColor = colors.HexColor("#326273")
-    doc = SimpleDocTemplate(str(OUTPUT_DIR / "store_report.pdf"), pagesize=A4, rightMargin=40, leftMargin=40, topMargin=42, bottomMargin=36)
+    styles["Heading2"].spaceBefore = 8
+    styles["Heading2"].spaceAfter = 5
+    styles["Heading2"].keepWithNext = True
+    styles["BodyText"].fontSize = 9
+    styles["BodyText"].leading = 12
+    bullet_style = ParagraphStyle(
+        "ReportBullet",
+        parent=styles["BodyText"],
+        leftIndent=12,
+        firstLineIndent=-8,
+        spaceAfter=3,
+    )
+    linked_number_style = ParagraphStyle(
+        "LinkedReportNumber", parent=bullet_style, keepWithNext=True
+    )
+    table_header_style = ParagraphStyle(
+        "TableHeader",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=7,
+        leading=8,
+        textColor=colors.white,
+        alignment=TA_CENTER,
+    )
+    table_cell_style = ParagraphStyle(
+        "TableCell", parent=styles["BodyText"], fontSize=7, leading=8
+    )
+    doc = SimpleDocTemplate(
+        str(OUTPUT_DIR / "store_report.pdf"),
+        pagesize=landscape(A4),
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=13 * mm,
+        bottomMargin=14 * mm,
+        title="Store Manager Retail Insight Report",
+        author="Store AI",
+    )
+
+    def table_widths(headers: list[str]) -> list[float]:
+        if "Business Meaning" in headers:
+            weights = [1.7, 1.0, 0.9, 0.9, 0.6, 0.8, 2.5]
+        elif "Gross Margin (Rs.)" in headers:
+            weights = [2.1, 0.7, 1.0, 1.2, 1.0, 1.0]
+        else:
+            weights = [1.0] * len(headers)
+        scale = doc.width / sum(weights)
+        return [weight * scale for weight in weights]
+
+    def on_page(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#d9e2ec"))
+        canvas.line(document.leftMargin, 10 * mm, landscape(A4)[0] - document.rightMargin, 10 * mm)
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#627d98"))
+        canvas.drawRightString(
+            landscape(A4)[0] - document.rightMargin,
+            6.5 * mm,
+            f"Store AI | Page {document.page}",
+        )
+        canvas.restoreState()
+
     story = []
-    for line in markdown_text.splitlines():
+    lines = markdown_text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         stripped = line.strip()
         if not stripped:
-            story.append(Spacer(1, 8))
+            story.append(Spacer(1, 5))
         elif stripped.startswith("# "):
-            story.append(Paragraph(stripped[2:], styles["Title"]))
+            story.append(Paragraph(escape(stripped[2:]), styles["Title"]))
             story.append(Spacer(1, 10))
         elif stripped.startswith("## "):
-            story.append(Paragraph(stripped[3:], styles["Heading2"]))
-            story.append(Spacer(1, 6))
+            story.append(Paragraph(escape(stripped[3:]), styles["Heading2"]))
         elif stripped.startswith("|"):
-            story.append(Paragraph(stripped.replace("|", " | "), styles["Code"]))
+            table_lines = []
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_lines.append(lines[index].strip())
+                index += 1
+            rows = [
+                [cell.strip() for cell in table_line.strip("|").split("|")]
+                for table_line in table_lines
+            ]
+            rows = [rows[0], *rows[2:]]
+            pdf_rows = []
+            for row_index, row in enumerate(rows):
+                cell_style = table_header_style if row_index == 0 else table_cell_style
+                pdf_rows.append([Paragraph(escape(cell), cell_style) for cell in row])
+            table = Table(pdf_rows, colWidths=table_widths(rows[0]), repeatRows=1, hAlign="LEFT")
+            table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#326273")),
+                        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#bcccdc")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0f4f8")]),
+                    ]
+                )
+            )
+            story.append(table)
+            story.append(Spacer(1, 6))
+            continue
+        elif stripped.startswith("- "):
+            story.append(Paragraph(escape(stripped[2:]), bullet_style, bulletText="-"))
+        elif len(stripped) > 3 and stripped[0].isdigit() and stripped[1:3] == ". ":
+            number_style = linked_number_style if stripped.startswith(("1. ", "2. ")) else bullet_style
+            story.append(Paragraph(escape(stripped[3:]), number_style, bulletText=stripped[:2]))
         else:
-            story.append(Paragraph("<br/>".join(wrap(stripped, 100)), styles["BodyText"]))
-            story.append(Spacer(1, 4))
-    doc.build(story)
+            story.append(Paragraph(escape(stripped), styles["BodyText"]))
+            story.append(Spacer(1, 3))
+        index += 1
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
 
 
 def print_terminal_answers(analysis: Analysis) -> None:
@@ -523,19 +868,22 @@ def main() -> int:
     analysis = analyze()
     generate_charts(analysis)
     facts = fact_package(analysis)
+    ai_runtime = get_ai_runtime_info()
     try:
-        llm_text = call_llm_if_configured(facts)
+        llm_text = call_llm_if_configured(facts, ai_runtime)
     except Exception as exc:
         print(f"WARNING: LLM request failed; deterministic explanations were used. Technical detail: {exc}")
         llm_text = None
-    report = build_report_markdown(analysis, llm_text)
+    report = build_report_markdown(analysis, llm_text, ai_runtime)
     (OUTPUT_DIR / "store_report.md").write_text(report, encoding="utf-8")
-    write_ai_insights(analysis, llm_text)
+    write_ai_insights(analysis, llm_text, ai_runtime)
+    write_ai_run_metadata(ai_runtime)
     write_pdf(report)
     print_terminal_answers(analysis)
     print("\nGenerated outputs/store_report.md")
     print("Generated outputs/store_report.pdf")
     print("Generated outputs/ai_manager_insights.md")
+    print("Generated outputs/ai_run_metadata.json")
     print("Generated outputs/charts/product_units.png")
     print("Generated outputs/charts/size_demand.png")
     print("Generated outputs/charts/weekday_revenue.png")

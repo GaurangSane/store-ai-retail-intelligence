@@ -1,0 +1,8 @@
+{
+  "provider": "Groq OpenAI-compatible API",
+  "model": "openai/gpt-oss-20b",
+  "ai_used_for": "Explaining verified Python-calculated retail facts only",
+  "python_used_for": "All calculations, category lift, inventory reconciliation, action selection, tables, charts, and report generation",
+  "temperature": 0.2,
+  "fallback_available": true
+}

@@ -13,6 +13,7 @@ __pycache__/
 
 # Streamlit local secrets
 .streamlit/secrets.toml
+.streamlit-test-tmp/
 
 # OS / editor
 .DS_Store

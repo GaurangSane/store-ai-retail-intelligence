@@ -22,9 +22,22 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python insight_engine.py
+streamlit run dashboard.py
 ```
 
-The script works without an LLM. To enable an OpenAI-compatible LLM, copy `.env.example` to `.env` locally and set `LLM_API_KEY`. Do not submit `.env`.
+The script works without an LLM. To enable the configured model, copy `.env.example` to `.env` locally and set `LLM_API_KEY`.
+
+`.env` is not included for security; `.env.example` is included. Never share the API key.
+
+## AI Model Used
+
+Model used: `openai/gpt-oss-20b` via Groq OpenAI-compatible API. If `LLM_MODEL` is changed in `.env`, the report, metadata, and dashboard display that actual configured model name.
+
+Python is the source of truth for every number, including gross margin, inventory reconciliation, category lift, and the three manager actions. AI is optional and only explains the verified fact package.
+
+## Running Code Can Be Shared
+
+Running code can be shared: `requirements.txt`, the CSV files, and the Python scripts are included. The recipient can install the requirements and run `python insight_engine.py` followed by `streamlit run dashboard.py`.
 
 ## Open Dashboard
 
@@ -47,6 +60,7 @@ The dashboard has sections for Overview, Product Performance, Inventory & Sizes,
 - `outputs/store_report.md`
 - `outputs/store_report.pdf`
 - `outputs/ai_manager_insights.md`
+- `outputs/ai_run_metadata.json`
 - `outputs/charts/product_units.png`
 - `outputs/charts/size_demand.png`
 - `outputs/charts/weekday_revenue.png`
