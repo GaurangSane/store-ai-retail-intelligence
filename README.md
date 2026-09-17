@@ -17,7 +17,7 @@ The store needs a weekly view of what is selling, which sizes are under pressure
 ## How to Run
 
 ```powershell
-cd E:\Store_AI
+cd store-ai-retail-intelligence
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
